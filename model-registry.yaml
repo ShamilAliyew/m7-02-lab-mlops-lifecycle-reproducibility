@@ -1,0 +1,166 @@
+registry:
+  name: northstar-models
+  backend: aws-s3
+  bucket: northstar-ml-registry
+  versioning_scheme: semantic
+  
+  stages:
+    - name: staging
+      description: "Automatically promoted after passing evaluation gates"
+      promoted_from: training
+      promotion_rule: automatic
+      lifetime_days: 30
+      gates:
+        - metric: macro_f1_score
+          operator: ">="
+          value: 0.82
+          description: "Macro F1 on frozen evaluation set"
+        - metric: per_city_f1_min
+          operator: ">="
+          value: 0.70
+          description: "Minimum F1 score across bottom 3 cities (by volume)"
+        - metric: p95_latency_ms
+          operator: "<="
+          value: 150
+          description: "95th percentile inference latency on standard hardware"
+        - metric: dataset_hash_mismatch
+          operator: "=="
+          value: "none"
+          description: "No drift in evaluation dataset from training data"
+        - check: "code_review_approved"
+          description: "At least one ML engineer code review of experiment"
+      
+    - name: production
+      description: "Human-approved promotion from staging for live inference"
+      promoted_from: staging
+      promotion_rule: manual
+      lifetime_days: null
+      retention_versions: 10
+      gates:
+        - metric: staging_soak_duration_hours
+          operator: ">="
+          value: 24
+          description: "Has been in staging for at least 24 hours without issues"
+        - metric: macro_f1_score
+          operator: ">="
+          value: 0.82
+          description: "Maintains macro F1 ≥ 0.82"
+        - metric: per_city_f1_min
+          operator: ">="
+          value: 0.70
+          description: "Maintains per-city F1 ≥ 0.70 for bottom 3 cities"
+        - check: "canary_success"
+          description: "Canary rollout (10% traffic) completed without SLA breach"
+        - check: "monitoring_alert_silence"
+          description: "No monitoring alerts in past 6 hours"
+      approvers:
+        - role: ml-team-lead
+          name: "ML Team Lead"
+        - role: ops-lead
+          name: "Operations Lead"
+      approval_deadline_hours: 72
+      
+    - name: archived
+      description: "Manually marked as deprecated; kept for lineage, not served"
+      promoted_from: production
+      promotion_rule: manual
+      gates: []
+      deprecation_reason_required: true
+
+models:
+  - name: eta
+    description: "Delivery arrival time prediction (ETA)"
+    owner: ml-team-lead
+    sla:
+      p95_latency_ms: 150
+      availability_percent: 99.5
+    inference_mode: online
+    qps_target: 200
+    retrain_interval_days: 14
+    retention_versions: 10
+    git_repo: "https://github.com/northstar/ml-models"
+    model_type: "xgboost"
+    
+  - name: dispatcher-routing
+    description: "Courier assignment for pickup requests"
+    owner: ml-team-lead
+    sla:
+      p95_latency_ms: 80
+      availability_percent: 99.9
+    inference_mode: online
+    qps_target: 50
+    retrain_interval_days: 30
+    retention_versions: 10
+    git_repo: "https://github.com/northstar/ml-models"
+    model_type: "lightgbm"
+
+lineage:
+  required_fields:
+    - git_sha
+      type: string
+      description: "Commit hash of training code at time of training"
+    - dataset_hash
+      type: string
+      format: "sha256"
+      description: "Hash of full training dataset (all files)"
+    - dataset_version
+      type: string
+      description: "Semantic version of dataset schema (e.g., 2025.01.v1)"
+    - framework_version
+      type: string
+      description: "Framework + version (e.g., xgboost==1.7.6)"
+    - python_version
+      type: string
+      description: "Python minor.patch (e.g., 3.11.5)"
+    - training_start_timestamp
+      type: string
+      format: "iso8601"
+      description: "Exact UTC timestamp of training start"
+    - random_seed
+      type: integer
+      description: "Single seed used for all numpy/random/tf.random calls"
+    - evaluation_set_hash
+      type: string
+      format: "sha256"
+      description: "Hash of frozen evaluation dataset (separate from training)"
+
+monitoring:
+  production_metrics:
+    - metric: inference_latency_p95_ms
+      check_interval_minutes: 5
+      alert_threshold: 200
+      rollback_threshold: 200
+      rollback_duration_minutes: 15
+      
+    - metric: prediction_drift_ks_statistic
+      check_interval_minutes: 60
+      alert_threshold: 0.05
+      description: "Kolmogorov-Smirnov test on prediction distribution vs baseline"
+      
+    - metric: f1_score_slice_bottom3_cities
+      check_interval_hours: 24
+      alert_threshold: 0.65
+      description: "Recomputed F1 on 100 samples per city for bottom 3 by volume"
+      
+    - metric: model_unavailability_duration_seconds
+      check_interval_minutes: 1
+      alert_threshold: 300
+      auto_rollback: true
+
+deployment:
+  canary:
+    traffic_percent_initial: 10
+    duration_hours: 4
+    success_criteria:
+      - p95_latency_ms <= 150
+      - error_rate_percent <= 0.5
+  
+  rollout:
+    duration_hours: 2
+    strategy: "linear"
+    auto_rollback_on_sla_breach: true
+
+retention:
+  archived_models_days: 365
+  training_artifacts_days: 90
+  evaluation_logs_days: 365
